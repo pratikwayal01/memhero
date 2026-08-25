@@ -19,6 +19,29 @@ MAX_BODY = 1_000_000
 INDEX_HTML = (Path(__file__).parent / "templates" / "index.html").read_text()
 svc = ChatService()
 
+# Verify DB connectivity at startup
+try:
+    store()
+except Exception as e:
+    import sys
+    print(f"Database not reachable: {e}", file=sys.stderr)
+    print("Run: docker compose up -d", file=sys.stderr)
+    sys.exit(1)
+
+# Warm up embed client — fails fast if API key is invalid
+try:
+    from . import llm
+    llm.embed_dim()
+except Exception as e:
+    import sys
+    from pathlib import Path
+    msg = str(e)
+    if "401" in msg or "authentication" in msg.lower() or "unauthorized" in msg.lower():
+        print(f"API key invalid or expired: regenerate keys in {Path('.env').resolve()}", file=sys.stderr)
+    else:
+        print(f"Embed check failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
 
 def _drain(user_id: str, conversation: str, message: str, reply: str):
     try:
@@ -135,8 +158,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    import sys
     print(f"memhero UI → http://localhost:{PORT}")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    except OSError as e:
+        if e.errno == 98:  # Address already in use
+            print(f"Port {PORT} already in use. Kill it: fuser -k {PORT}/tcp", file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":

@@ -66,12 +66,15 @@ class MemoryStore:
         )
 
     def enforce_cap(self, user_id: str, cap: int) -> int:
-        """Evict least-recently-updated beyond cap."""
-        # ponytail: recency-based eviction; score-aware eviction if quality degrades
+        """Evict lowest-scoring memories beyond cap. Score = recency × access_count.
+        Old-but-frequently-accessed facts survive; stale facts go first."""
         row = self._conn.execute(
             """WITH over AS (
                  SELECT id FROM memories WHERE user_id = %s
-                 ORDER BY updated_at DESC OFFSET %s
+                 ORDER BY
+                   (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0) DESC
+                   - (access_count * 10) DESC
+                 OFFSET %s
                )
                DELETE FROM memories WHERE id IN (SELECT id FROM over) RETURNING 1""",
             (user_id, cap),

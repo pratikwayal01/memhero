@@ -1,4 +1,7 @@
-.PHONY: up down restart logs ps sync ui api cli mcp eval test clean
+.PHONY: up down restart logs ps sync ui api cli mcp eval test clean kill
+
+kill:          ## force-kill server on port 8765
+	fuser -k 8765/tcp || true
 
 up:            ## start db + langfuse
 	docker compose up -d

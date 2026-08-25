@@ -26,6 +26,9 @@ class ChatService:
         t0 = time.perf_counter()
         retrieved = []
         if use_memory:
+            # drain any pending extractions from previous turns first
+            # (closes the async consistency gap — enqueued facts are stored before retrieval)
+            self.drain_pending(user_id)
             # slot-direct first: zero embedding cost for known-slot queries
             slots = llm.detect_slots(message)
             if slots:

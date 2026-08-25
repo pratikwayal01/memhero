@@ -37,7 +37,7 @@ class Config:
     langfuse_secret_key: str | None = field(default_factory=lambda: os.environ.get("LANGFUSE_SECRET_KEY"))
 
     # memory tuning
-    retrieve_k: int = 8
+    retrieve_k: int = field(default_factory=lambda: int(os.environ.get("MEMHERO_RETRIEVE_K", "8")))
     retrieve_min_sim: float = 0.25
     dup_sim: float = 0.65          # candidate vs existing -> treat as same topic for reconcile
     cap_per_user: int = 500
