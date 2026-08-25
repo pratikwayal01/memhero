@@ -1,0 +1,38 @@
+[project]
+name = "memhero"
+version = "0.1.0"
+description = "Conversational memory layer prototype for a chat assistant"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "psycopg[binary,pool]>=3.2",
+    "pgvector>=0.3",
+    "gradio>=4.40",
+    "langfuse>=2.50,<3",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "mcp>=2.1.0",
+]
+
+[project.scripts]
+memhero-api = "memhero.api:main"
+memhero-cli = "memhero.cli:main"
+memhero-ui = "memhero.ui:main"
+memhero-http = "memhero.http_server:main"
+memhero-mcp = "memhero.mcp_server:main"
+
+[project.optional-dependencies]
+local-embeddings = ["sentence-transformers>=3"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["memhero", "eval"]

@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memhero — Conversational Memory</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --acc:#2f81f7; --ok:#3fb950; --warn:#d29922; --err:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px;
+           border-bottom:1px solid var(--border); background:var(--panel); }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .tag { font-size:11px; color:var(--muted); border:1px solid var(--border);
+                border-radius:10px; padding:2px 8px; }
+  #layout { display:grid; grid-template-columns:1fr 360px; height:calc(100vh - 49px); }
+  #chat { display:flex; flex-direction:column; }
+  #log { flex:1; overflow-y:auto; padding:16px 20px; }
+  .msg { max-width:78%; margin:6px 0; padding:10px 12px; border-radius:10px; white-space:pre-wrap; }
+  .user { margin-left:auto; background:var(--acc); color:#fff; }
+  .bot { background:var(--panel); border:1px solid var(--border); }
+  .meta { font-size:11px; color:var(--muted); margin-top:6px; }
+  .meta .ok { color:var(--ok); } .meta .warn { color:var(--warn); }
+  #inputrow { display:flex; gap:8px; padding:12px 20px; border-top:1px solid var(--border);
+              background:var(--panel); }
+  #input { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+           border-radius:8px; padding:10px 12px; }
+  #input:focus { outline:1px solid var(--acc); }
+  button { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:10px 16px;
+           cursor:pointer; font:inherit; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .toggle { background:var(--panel); border:1px solid var(--border); color:var(--fg); }
+  .toggle.on { background:var(--ok); color:#0d1117; border-color:var(--ok); }
+  #side { border-left:1px solid var(--border); background:var(--panel); overflow-y:auto; padding:16px; }
+  #side h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:14px 0 8px; }
+  .card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:8px 10px; margin:6px 0; }
+  .card .c { font-size:13px; }
+  .card .k { font-size:11px; color:var(--muted); margin-top:3px; }
+  .empty { color:var(--muted); font-size:12px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row input { background:var(--bg); border:1px solid var(--border); color:var(--fg); border-radius:6px; padding:4px 8px; }
+  .row input:focus { outline:1px solid var(--acc); }
+  .forget-row { display:flex; gap:6px; margin-top:12px; }
+  .forget-row input { flex:1; background:var(--bg); border:1px solid var(--border); color:var(--fg); border-radius:6px; padding:4px 8px; }
+  .forget-row button { padding:6px 12px; font-size:12px; background:var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>memhero</h1><span class="tag">prototype</span>
+  <span class="tag">Postgres + pgvector</span>
+  <span class="tag">Gemini embeds</span>
+  <span style="flex:1"></span>
+  <label style="font-size:12px;color:var(--muted)">user_id
+    <input id="uid" value="demo" style="background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:4px 8px">
+  </label>
+  <button id="newchat" class="toggle">+ new chat</button>
+  <button id="reset" class="toggle">reset</button>
+</header>
+<div id="layout">
+  <div id="chat">
+    <div id="log">
+      <div class="msg bot">memhero memory layer. Try:<br>
+        1. "I live in Delhi" → then "I moved to Bangalore" → then "where do I live?" (conflict)<br>
+        2. "I have a peanut allergy" → then ask for dinner ideas (proactive recall)<br>
+        3. "forget my address" → ask again (forgetting works)<br>
+        Toggle <b>memory on/off</b> to compare. Memories survive restarts (Postgres).
+      </div>
+    </div>
+    <div id="inputrow">
+      <button id="togmem" class="toggle on">memory: ON</button>
+      <input id="input" placeholder="Message…" autofocus>
+      <button id="send">Send</button>
+    </div>
+  </div>
+  <div id="side">
+    <h2>Injected this turn</h2>
+    <div id="injected"><div class="empty">— none —</div></div>
+    <h2>Forget</h2>
+    <div style="color:var(--muted);font-size:12px">Click <span style="color:var(--err)">✕</span> on a memory to delete it.</div>
+    <h2>Memory store</h2>
+    <div id="store"><div class="empty">nothing stored yet</div></div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const uid = () => $("uid").value.trim() || "demo";
+let memoryOn = true;
+
+async function post(path, body) {
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(body)});
+  return r.json();
+}
+
+function addMsg(role, html, meta) {
+  const d = document.createElement("div");
+  d.className = "msg " + role;
+  d.innerHTML = html;
+  if (meta) { const m = document.createElement("div"); m.className = "meta"; m.innerHTML = meta; d.appendChild(m); }
+  $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
+  return d;
+}
+
+function card(m) {
+  return `<div class="card" style="display:flex;justify-content:space-between;align-items:flex-start">
+    <div><div class="c">${escapeHtml(String(m.content ?? ""))}</div>
+    <div class="k">${escapeHtml((m.updated||"").slice(0,19))}</div></div>
+    <button onclick="deleteMem('${escapeHtml(String(m.id))}')" style="background:var(--err);padding:2px 8px;font-size:11px;margin-left:8px;flex-shrink:0">✕</button></div>`;
+}
+
+function render(m) {
+  const inj = $("injected");
+  inj.innerHTML = m.retrieved.length
+    ? m.retrieved.map(c => `<div class="card"><div class="c">${escapeHtml(String(c))}</div></div>`).join("")
+    : '<div class="empty">— none —</div>';
+  const st = $("store");
+  st.innerHTML = m.store.length
+    ? m.store.map(card).join("") : '<div class="empty">nothing stored yet</div>';
+}
+
+async function send() {
+  const msg = $("input").value.trim();
+  if (!msg || $("send").disabled) return;
+  $("input").value = ""; $("send").disabled = true;
+  addMsg("user", escapeHtml(msg));
+  const bot = addMsg("bot", "<i>…</i>");
+  const t0 = performance.now();
+  try {
+    const r = await post("/api/chat", {message: msg, user_id: uid(), with_memory: memoryOn});
+    if (r.error) {
+      bot.innerHTML = `<span style="color:var(--err)">error: ${escapeHtml(String(r.error))}</span>`;
+      return;
+    }
+    const t = r.times;
+    bot.innerHTML = escapeHtml(r.answer);
+    const m = document.createElement("div"); m.className = "meta";
+    m.innerHTML = `<span class="${t.memory_ms <= 50 ? "ok" : "warn"}">retrieve ${t.memory_ms}ms</span>
+      · llm ${t.inline_ms}ms · wall ${t.wall_ms}ms`;
+    bot.appendChild(m);
+    render(r);
+  } catch (e) {
+    bot.innerHTML = `<span style="color:var(--err)">request failed: ${escapeHtml(String(e))}</span>`;
+  } finally { $("send").disabled = false; }
+}
+
+async function loadMemories() {
+  const r = await fetch("/api/memories?user_id=" + encodeURIComponent(uid()));
+  const d = await r.json();
+  render({retrieved: [], store: d.memories || []});
+}
+
+async function deleteMem(id) {
+  const r = await post("/api/forget", {mem_id: id, user_id: uid()});
+  if (r.deleted !== undefined) render({retrieved: [], store: r.memories || []});
+}
+
+function newChat() {
+  $("log").innerHTML = `<div class="msg bot">New conversation with <b>${escapeHtml(uid())}</b>. Continuing with all memories…</div>`;
+  loadMemories();
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+$("send").onclick = send;
+$("input").addEventListener("keydown", e => { if (e.key === "Enter") send(); });
+$("togmem").onclick = () => {
+  memoryOn = !memoryOn;
+  $("togmem").textContent = "memory: " + (memoryOn ? "ON" : "OFF");
+  $("togmem").classList.toggle("on", memoryOn);
+};
+$("reset").onclick = async () => {
+  await post("/api/reset", {user_id: uid()});
+  render({retrieved: [], store: []});
+  addMsg("bot", "memory cleared for <b>" + escapeHtml(uid()) + "</b>");
+};
+$("newchat").onclick = newChat;
+loadMemories();
+</script>
+</body>
+</html>

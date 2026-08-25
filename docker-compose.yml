@@ -1,0 +1,63 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: memhero
+      POSTGRES_PASSWORD: memhero
+      POSTGRES_DB: memhero
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memhero"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  langfuse-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  langfuse:
+    image: langfuse/langfuse:2
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: memhero-dev-secret-change-me
+      SALT: memhero-dev-salt
+      NEXTAUTH_URL: http://localhost:3000
+      TELEMETRY_ENABLED: "false"
+      # bootstrap a default org/project so the API keys exist on first boot
+      LANGFUSE_INIT_ORG_ID: memhero-org
+      LANGFUSE_INIT_PROJECT_ID: memhero
+      LANGFUSE_INIT_PROJECT_NAME: memhero
+      LANGFUSE_INIT_USER_EMAIL: dev@memhero.local
+      LANGFUSE_INIT_USER_NAME: dev
+      LANGFUSE_INIT_USER_PASSWORD: memhero-dev
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-memhero-dev
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-memhero-dev-secret
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  pgdata:
+  langfuse_pgdata:
