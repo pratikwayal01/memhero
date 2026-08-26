@@ -38,6 +38,7 @@ CREATE INDEX IF NOT EXISTS memory_events_org_user_idx ON memory_events (org_id, 
 -- claimed_by/claimed_at prevents double-processing across workers/restarts.
 CREATE TABLE IF NOT EXISTS pending_extractions (
     id          BIGSERIAL PRIMARY KEY,
+    org_id      TEXT NOT NULL DEFAULT '',
     user_id     TEXT NOT NULL,
     conversation TEXT NOT NULL DEFAULT '',
     turn        JSONB NOT NULL,

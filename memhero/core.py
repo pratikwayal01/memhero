@@ -76,8 +76,7 @@ class MemoryStore:
             """WITH over AS (
                  SELECT id FROM memories WHERE org_id = %s AND user_id = %s AND status = 'active'
                  ORDER BY
-                   (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0) DESC
-                   - (access_count * 10) DESC
+                   (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0 - access_count * 10) DESC
                  OFFSET %s
                )
                UPDATE memories SET status = 'archived', updated_at = now()
