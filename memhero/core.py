@@ -1,5 +1,6 @@
 """MemoryStore: Postgres + pgvector persistence for discrete facts."""
 
+import itertools
 import json
 import math
 import uuid
@@ -20,25 +21,30 @@ class Memory:
     user_id: str
     content: str
     sim: float = 0.0
+    importance: float = 0.5
     access_count: int = 0
     updated_at: str = ""
 
 
 class MemoryStore:
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, org_id: str = ""):
+        self.org_id = org_id
         self._conn = psycopg.connect(dsn, autocommit=True)
         self._conn.execute("SELECT 1")
         register_vector(self._conn)
 
     # -- write ops -----------------------------------------------------------
 
-    def add(self, user_id: str, content: str, vec, slot: str | None = None) -> str:
+    def add(self, user_id: str, content: str, vec, slot: str | None = None,
+            importance: float = 0.5, ttl_days: int | None = None) -> str:
         mid = str(uuid.uuid4())
+        expires = f"now() + interval '{int(ttl_days)} days'" if ttl_days else "NULL"
         self._conn.execute(
-            "INSERT INTO memories (id, user_id, slot, content, embedding) VALUES (%s, %s, %s, %s, %s)",
-            (mid, user_id, slot, content, _vec(vec)),
+            f"""INSERT INTO memories (id, org_id, user_id, slot, content, embedding, importance, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, {expires})""",
+            (mid, self.org_id, user_id, slot, content, _vec(vec), max(0.0, min(1.0, importance))),
         )
-        self._log(mid, user_id, "ADD", {"content": content, "slot": slot})
+        self._log(mid, user_id, "ADD", {"content": content, "slot": slot, "importance": importance})
         return mid
 
     def update(self, memory_id: str, user_id: str, content: str, vec) -> None:
@@ -66,104 +72,117 @@ class MemoryStore:
         )
 
     def enforce_cap(self, user_id: str, cap: int) -> int:
-        """Evict lowest-scoring memories beyond cap. Score = recency × access_count.
-        Old-but-frequently-accessed facts survive; stale facts go first."""
+        """Archive lowest-scoring memories beyond cap. Score = age penalty − access bonus."""
         row = self._conn.execute(
             """WITH over AS (
-                 SELECT id FROM memories WHERE user_id = %s
+                 SELECT id FROM memories WHERE org_id = %s AND user_id = %s AND status = 'active'
                  ORDER BY
                    (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0) DESC
                    - (access_count * 10) DESC
                  OFFSET %s
                )
-               DELETE FROM memories WHERE id IN (SELECT id FROM over) RETURNING 1""",
-            (user_id, cap),
+               UPDATE memories SET status = 'archived', updated_at = now()
+               WHERE id IN (SELECT id FROM over) RETURNING 1""",
+            (self.org_id, user_id, cap),
         ).fetchall()
         n = len(row)
         if n:
             self._log(None, user_id, "EVICT", {"count": n, "reason": "cap"})
         return n
 
-    # -- read ops ------------------------------------------------------------
+    # -- read ops (all filter by org_id, status='active', non-expired) ----------
 
     def search(self, user_id: str, query_vec, k: int, min_sim: float) -> list[Memory]:
         rows = self._conn.execute(
-            """SELECT id, content, access_count,
+            """SELECT id, content, importance, access_count,
                       to_char(updated_at, 'YYYY-MM-DD'),
                       1 - (embedding <=> %s) AS sim
-               FROM memories WHERE user_id = %s
+               FROM memories
+               WHERE org_id = %s AND user_id = %s
+                 AND status = 'active'
+                 AND (expires_at IS NULL OR expires_at > now())
                ORDER BY embedding <=> %s LIMIT 50""",
-            (_vec(query_vec), user_id, _vec(query_vec)),
+            (_vec(query_vec), self.org_id, user_id, _vec(query_vec)),
         ).fetchall()
         scored = []
-        for mid, content, cnt, updated, sim in rows:
+        for mid, content, importance, cnt, updated, sim in rows:
             mid = str(mid)
             if sim < min_sim:
                 continue
             days_old = _days_since(updated)
             decay = 1.0 if days_old <= 90 else 0.3
-            score = sim * (1 + math.log1p(cnt)) * decay
+            score = sim * importance * (1 + math.log1p(cnt)) * decay
             scored.append((score, Memory(id=mid, user_id=user_id, content=content,
-                                         sim=sim, access_count=cnt, updated_at=updated)))
+                                          sim=sim, importance=importance,
+                                          access_count=cnt, updated_at=updated)))
         scored.sort(key=lambda t: t[0], reverse=True)
         return [m for _, m in scored[:k]]
 
     def slot_search(self, user_id: str, slots: list[str]) -> list[Memory]:
-        """Direct slot lookup — zero embedding cost. For known-slot queries like 'where do i live?'."""
         rows = self._conn.execute(
-            """SELECT id, slot, content, access_count, to_char(updated_at, 'YYYY-MM-DD')
-               FROM memories WHERE user_id = %s AND slot = ANY(%s)
+            """SELECT id, content, importance, access_count, to_char(updated_at, 'YYYY-MM-DD')
+               FROM memories WHERE org_id = %s AND user_id = %s AND slot = ANY(%s)
+                 AND status = 'active' AND (expires_at IS NULL OR expires_at > now())
                ORDER BY updated_at DESC""",
-            (user_id, slots),
+            (self.org_id, user_id, slots),
         ).fetchall()
-        return [Memory(id=str(r[0]), user_id=user_id, content=r[2], access_count=r[3], updated_at=r[4])
+        return [Memory(id=str(r[0]), user_id=user_id, content=r[1],
+                       importance=r[2], access_count=r[3], updated_at=r[4])
                 for r in rows]
 
     def has_slot(self, user_id: str, slot: str) -> str | None:
-        """Return current value for a slot if it exists."""
         row = self._conn.execute(
-            "SELECT content FROM memories WHERE user_id = %s AND slot = %s ORDER BY updated_at DESC LIMIT 1",
-            (user_id, slot),
+            """SELECT content FROM memories WHERE org_id = %s AND user_id = %s AND slot = %s
+               AND status = 'active' ORDER BY updated_at DESC LIMIT 1""",
+            (self.org_id, user_id, slot),
         ).fetchone()
         return row[0] if row else None
 
     def near_duplicates(self, user_id: str, vec, min_sim: float, k: int = 4) -> list[Memory]:
         rows = self._conn.execute(
             """SELECT id, content, 1 - (embedding <=> %s) AS sim
-               FROM memories WHERE user_id = %s AND 1 - (embedding <=> %s) >= %s
+               FROM memories WHERE org_id = %s AND user_id = %s
+                 AND status = 'active' AND 1 - (embedding <=> %s) >= %s
                ORDER BY embedding <=> %s LIMIT %s""",
-            (_vec(vec), user_id, _vec(vec), min_sim, _vec(vec), k),
+            (_vec(vec), self.org_id, user_id, _vec(vec), min_sim, _vec(vec), k),
         ).fetchall()
         return [Memory(id=str(r[0]), user_id=user_id, content=r[1], sim=r[2]) for r in rows]
 
     def list_memories(self, user_id: str, limit: int = 200) -> list[Memory]:
         rows = self._conn.execute(
-            """SELECT id, content, access_count, to_char(updated_at, 'YYYY-MM-DD')
-               FROM memories WHERE user_id = %s ORDER BY updated_at DESC LIMIT %s""",
-            (user_id, limit),
+            """SELECT id, content, importance, access_count, to_char(updated_at, 'YYYY-MM-DD')
+               FROM memories WHERE org_id = %s AND user_id = %s AND status = 'active'
+               ORDER BY updated_at DESC LIMIT %s""",
+            (self.org_id, user_id, limit),
         ).fetchall()
         return [Memory(id=str(r[0]), user_id=user_id, content=r[1],
-                       access_count=r[2], updated_at=r[3]) for r in rows]
+                       importance=r[2], access_count=r[3], updated_at=r[4]) for r in rows]
 
     def count(self, user_id: str) -> int:
         return self._conn.execute(
-            "SELECT count(*) FROM memories WHERE user_id = %s", (user_id,)
+            "SELECT count(*) FROM memories WHERE org_id = %s AND user_id = %s AND status = 'active'",
+            (self.org_id, user_id),
         ).fetchone()[0]
 
     def clear_user(self, user_id: str) -> int:
+        """Soft-delete: archive all active memories for a user."""
         n = self._conn.execute(
-            "DELETE FROM memories WHERE user_id = %s RETURNING 1", (user_id,)
+            """UPDATE memories SET status = 'archived', updated_at = now()
+               WHERE org_id = %s AND user_id = %s AND status = 'active' RETURNING 1""",
+            (self.org_id, user_id),
         ).fetchall()
-        # purge pending extractions so they don't resurrect after reset
-        self._conn.execute("DELETE FROM pending_extractions WHERE user_id = %s", (user_id,))
+        self._conn.execute(
+            "DELETE FROM pending_extractions WHERE org_id = %s AND user_id = %s",
+            (self.org_id, user_id),
+        )
         return len(n)
 
     # -- extraction queue (crash-safe) ---------------------------------------
 
     def enqueue_turn(self, user_id: str, conversation: str, user_msg: str, assistant_msg: str) -> None:
         self._conn.execute(
-            "INSERT INTO pending_extractions (user_id, conversation, turn) VALUES (%s, %s, %s)",
-            (user_id, conversation, json.dumps({"user": user_msg, "assistant": assistant_msg})),
+            "INSERT INTO pending_extractions (org_id, user_id, conversation, turn) VALUES (%s, %s, %s, %s)",
+            (self.org_id, user_id, conversation, json.dumps({"user": user_msg, "assistant": assistant_msg})),
         )
 
     def drain(self, user_id: str | None = None, limit: int = 5, claimant: str | None = None) -> list[dict]:
@@ -171,13 +190,14 @@ class MemoryStore:
         rows = self._conn.execute(
             """WITH picked AS (
                    SELECT id FROM pending_extractions
-                   WHERE (claimed_by IS NULL OR claimed_at < now() - interval '5 minutes')
+                   WHERE org_id = %s
+                     AND (claimed_by IS NULL OR claimed_at < now() - interval '5 minutes')
                      AND (user_id = %s OR %s::text IS NULL)
                    ORDER BY created_at LIMIT %s
                )
                UPDATE pending_extractions SET claimed_by = %s, claimed_at = now()
                WHERE id IN (SELECT id FROM picked) RETURNING *""",
-            (user_id, user_id, limit, claimant),
+            (self.org_id, user_id, user_id, limit, claimant),
         ).fetchall()
         if not rows:
             return []
@@ -187,12 +207,65 @@ class MemoryStore:
     def dequeued(self, ids: list[int]) -> None:
         self._conn.execute("DELETE FROM pending_extractions WHERE id = ANY(%s)", (ids,))
 
+    # -- TTL cleanup -----------------------------------------------------------
+
+    def expire_ttl(self, user_id: str | None = None) -> int:
+        """Archive memories past their TTL."""
+        rows = self._conn.execute(
+            """UPDATE memories SET status = 'archived', updated_at = now()
+               WHERE org_id = %s AND (user_id = %s OR %s::text IS NULL)
+                 AND expires_at IS NOT NULL AND expires_at < now()
+                 AND status = 'active'
+               RETURNING 1""",
+            (self.org_id, user_id, user_id),
+        ).fetchall()
+        if rows:
+            self._log(None, user_id or "*", "TTL_EXPIRED", {"count": len(rows)})
+        return len(rows)
+
+    # -- compaction (consolidate similar facts) -------------------------------
+
+    def consolidate_candidates(self, user_id: str, min_sim: float = 0.85, max_groups: int = 3) -> list[dict]:
+        """Find clusters of similar active memories. Returns [{'ids':[...], 'contents':[...]}].
+        pony: pairwise cosine check, capped at max_groups to bound cost."""
+        rows = self._conn.execute(
+            """SELECT id, content FROM memories
+               WHERE org_id = %s AND user_id = %s AND status = 'active'
+               ORDER BY updated_at DESC LIMIT 200""",
+            (self.org_id, user_id),
+        ).fetchall()
+        if len(rows) < 3:
+            return []
+        clusters = []
+        used = set()
+        for (aid, ac), (bid, bc) in itertools.combinations(rows, 2):
+            if aid in used or bid in used:
+                continue
+            r = self._conn.execute(
+                """SELECT 1 - (embedding <=> (SELECT embedding FROM memories WHERE id = %s)) AS sim
+                   FROM memories WHERE id = %s""",
+                (aid, bid),
+            ).fetchone()
+            if r and r[0] >= min_sim:
+                clusters.append({"ids": [str(aid), str(bid)], "contents": [ac, bc]})
+                used.update([aid, bid])
+                if len(clusters) >= max_groups:
+                    break
+        return clusters
+
+    def mark_consolidated(self, old_ids: list[str], new_id: str) -> None:
+        self._conn.execute(
+            """UPDATE memories SET status = 'consolidated', superseded_by = %s, updated_at = now()
+               WHERE id = ANY(%s)""",
+            (new_id, old_ids),
+        )
+
     # -- audit ---------------------------------------------------------------
 
     def _log(self, memory_id: str | None, user_id: str, action: str, detail: dict) -> None:
         self._conn.execute(
-            "INSERT INTO memory_events (memory_id, user_id, action, detail) VALUES (%s, %s, %s, %s)",
-            (memory_id, user_id, action, json.dumps(detail)),
+            "INSERT INTO memory_events (memory_id, org_id, user_id, action, detail) VALUES (%s, %s, %s, %s, %s)",
+            (memory_id, self.org_id, user_id, action, json.dumps(detail)),
         )
 
 

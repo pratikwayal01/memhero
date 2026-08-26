@@ -95,6 +95,8 @@ class ChatService:
             return {"ops": [{"op": "GUARD_DROPPED_ALL"}]}
 
         slots = [c.get("slot") for c in candidates]
+        importances = [c.get("importance", 0.5) for c in candidates]
+        ttl_days_list = [c.get("ttl_days") for c in candidates]
         vecs = llm.embed(contents)
         matches = [
             [(m.id, m.content) for m in store().near_duplicates(user_id, v, cfg.dup_sim)]
@@ -104,7 +106,7 @@ class ChatService:
             ops = [{"op": "ADD", "content": c, "slot": s} for c, s in zip(contents, slots)]
         else:
             ops = llm.reconcile(contents, matches)
-        applied = self._apply_ops(user_id, contents, ops, vecs, slots)
+        applied = self._apply_ops(user_id, contents, ops, vecs, slots, importances, ttl_days_list)
         store().enforce_cap(user_id, cfg.cap_per_user)
         return {"ops": ops, "applied": applied}
 
@@ -130,17 +132,52 @@ class ChatService:
         except Exception as e:
             print(f"[memhero] background drain failed: {e}")
 
-    def _apply_ops(self, user_id: str, candidates: list[str], ops: list[dict], vecs, slots=None) -> int:
+    # -- compaction (consolidate similar facts) --------------------------------
+
+    def consolidate(self, user_id: str) -> dict:
+        """Find similar active memories and ask LLM to merge into fewer, richer facts.
+        Runs in background. Returns stats."""
+        candidates = store().consolidate_candidates(user_id)
+        if not candidates:
+            return {"merged": 0}
+        merged = 0
+        for cluster in candidates:
+            try:
+                prompt = f"Combine these similar facts into ONE precise fact:\n"
+                for c in cluster["contents"]:
+                    prompt += f"- {c}\n"
+                prompt += "Return ONLY the consolidated fact as plain text."
+                consolidated = llm.aux_chat(
+                    [{"role": "user", "content": prompt}], temperature=0,
+                ).strip()
+                if not consolidated:
+                    continue
+                vec = llm.embed([consolidated])[0]
+                new_id = store().add(user_id, consolidated, vec)
+                store().mark_consolidated(cluster["ids"], new_id)
+                merged += 1
+            except Exception as e:
+                print(f"[consolidate] failed: {type(e).__name__}: {e}")
+        # also clean up TTL-expired
+        store().expire_ttl(user_id)
+        return {"merged": merged}
+
+    def _apply_ops(self, user_id: str, candidates: list[str], ops: list[dict], vecs,
+                   slots=None, importances=None, ttl_days_list=None) -> int:
         s = store()
         n = 0
         slots = slots or [None] * len(candidates)
+        importances = importances or [0.5] * len(candidates)
+        ttl_days_list = ttl_days_list or [None] * len(candidates)
         for i, op in enumerate(ops):
             try:
                 cand_idx = min(i, len(vecs) - 1)
                 slot = slots[cand_idx] if cand_idx < len(slots) else None
+                imp = importances[cand_idx]
+                ttl = ttl_days_list[cand_idx]
                 if op["op"] == "ADD":
                     content = op.get("content") or candidates[i]
-                    s.add(user_id, content, vecs[cand_idx], slot=slot)
+                    s.add(user_id, content, vecs[cand_idx], slot=slot, importance=imp, ttl_days=ttl)
                 elif op["op"] in ("UPDATE", "SUPERSEDE"):
                     mid = op["id"]
                     exists = any(m.id == mid for m in s.list_memories(user_id, limit=10_000))

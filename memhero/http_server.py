@@ -28,19 +28,17 @@ except Exception as e:
     print("Run: docker compose up -d", file=sys.stderr)
     sys.exit(1)
 
-# Warm up embed client — fails fast if API key is invalid
+# Warm up embed client — warns if API key is invalid, continues for local dev
 try:
     from . import llm
     llm.embed_dim()
 except Exception as e:
     import sys
-    from pathlib import Path
     msg = str(e)
     if "401" in msg or "authentication" in msg.lower() or "unauthorized" in msg.lower():
-        print(f"API key invalid or expired: regenerate keys in {Path('.env').resolve()}", file=sys.stderr)
+        print(f"WARNING: API key invalid — chats will fail. Fix keys in .env or set MEMHERO_EMBED_PROVIDER=local", file=sys.stderr)
     else:
-        print(f"Embed check failed: {e}", file=sys.stderr)
-    sys.exit(1)
+        print(f"WARNING: Embed check failed: {e}", file=sys.stderr)
 
 
 def _drain(user_id: str, conversation: str, message: str, reply: str):
