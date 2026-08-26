@@ -1,6 +1,5 @@
 """MemoryStore: Postgres + pgvector persistence for discrete facts."""
 
-import itertools
 import json
 import math
 import uuid
@@ -206,59 +205,6 @@ class MemoryStore:
 
     def dequeued(self, ids: list[int]) -> None:
         self._conn.execute("DELETE FROM pending_extractions WHERE id = ANY(%s)", (ids,))
-
-    # -- TTL cleanup -----------------------------------------------------------
-
-    def expire_ttl(self, user_id: str | None = None) -> int:
-        """Archive memories past their TTL."""
-        rows = self._conn.execute(
-            """UPDATE memories SET status = 'archived', updated_at = now()
-               WHERE org_id = %s AND (user_id = %s OR %s::text IS NULL)
-                 AND expires_at IS NOT NULL AND expires_at < now()
-                 AND status = 'active'
-               RETURNING 1""",
-            (self.org_id, user_id, user_id),
-        ).fetchall()
-        if rows:
-            self._log(None, user_id or "*", "TTL_EXPIRED", {"count": len(rows)})
-        return len(rows)
-
-    # -- compaction (consolidate similar facts) -------------------------------
-
-    def consolidate_candidates(self, user_id: str, min_sim: float = 0.85, max_groups: int = 3) -> list[dict]:
-        """Find clusters of similar active memories. Returns [{'ids':[...], 'contents':[...]}].
-        pony: pairwise cosine check, capped at max_groups to bound cost."""
-        rows = self._conn.execute(
-            """SELECT id, content FROM memories
-               WHERE org_id = %s AND user_id = %s AND status = 'active'
-               ORDER BY updated_at DESC LIMIT 200""",
-            (self.org_id, user_id),
-        ).fetchall()
-        if len(rows) < 3:
-            return []
-        clusters = []
-        used = set()
-        for (aid, ac), (bid, bc) in itertools.combinations(rows, 2):
-            if aid in used or bid in used:
-                continue
-            r = self._conn.execute(
-                """SELECT 1 - (embedding <=> (SELECT embedding FROM memories WHERE id = %s)) AS sim
-                   FROM memories WHERE id = %s""",
-                (aid, bid),
-            ).fetchone()
-            if r and r[0] >= min_sim:
-                clusters.append({"ids": [str(aid), str(bid)], "contents": [ac, bc]})
-                used.update([aid, bid])
-                if len(clusters) >= max_groups:
-                    break
-        return clusters
-
-    def mark_consolidated(self, old_ids: list[str], new_id: str) -> None:
-        self._conn.execute(
-            """UPDATE memories SET status = 'consolidated', superseded_by = %s, updated_at = now()
-               WHERE id = ANY(%s)""",
-            (new_id, old_ids),
-        )
 
     # -- audit ---------------------------------------------------------------
 

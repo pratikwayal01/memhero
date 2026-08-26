@@ -132,37 +132,7 @@ class ChatService:
         except Exception as e:
             print(f"[memhero] background drain failed: {e}")
 
-    # -- compaction (consolidate similar facts) --------------------------------
-
-    def consolidate(self, user_id: str) -> dict:
-        """Find similar active memories and ask LLM to merge into fewer, richer facts.
-        Runs in background. Returns stats."""
-        candidates = store().consolidate_candidates(user_id)
-        if not candidates:
-            return {"merged": 0}
-        merged = 0
-        for cluster in candidates:
-            try:
-                prompt = f"Combine these similar facts into ONE precise fact:\n"
-                for c in cluster["contents"]:
-                    prompt += f"- {c}\n"
-                prompt += "Return ONLY the consolidated fact as plain text."
-                consolidated = llm.aux_chat(
-                    [{"role": "user", "content": prompt}], temperature=0,
-                ).strip()
-                if not consolidated:
-                    continue
-                vec = llm.embed([consolidated])[0]
-                new_id = store().add(user_id, consolidated, vec)
-                store().mark_consolidated(cluster["ids"], new_id)
-                merged += 1
-            except Exception as e:
-                print(f"[consolidate] failed: {type(e).__name__}: {e}")
-        # also clean up TTL-expired
-        store().expire_ttl(user_id)
-        return {"merged": merged}
-
-    def _apply_ops(self, user_id: str, candidates: list[str], ops: list[dict], vecs,
+    _apply_ops(self, user_id: str, candidates: list[str], ops: list[dict], vecs,
                    slots=None, importances=None, ttl_days_list=None) -> int:
         s = store()
         n = 0
