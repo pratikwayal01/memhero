@@ -6,6 +6,117 @@ Long-term memory for LLM agents. Extract facts from conversations, store in
 Postgres+pgvector, retrieve semantically on later turns. Single Python package
 with multiple interfaces (CLI, HTTP API, HTML UI, Gradio UI, MCP).
 
+## Design rationale — why this architecture
+
+### Problem: LLMs have no long-term memory
+
+Every conversation starts from zero. Chatbots don't remember your name,
+preferences, or past decisions. Solutions fall into three categories:
+
+**1. Full context dump** — stuff entire history into system prompt.
+- Breaks at scale: 100 conversations = 100k tokens → slow, expensive, LLM attention degrades.
+
+**2. Embedding everything** (mem0, Chroma-based) — embed every message, retrieve on similarity.
+- Every turn pays embedding cost. Chitchat ("ok", "thanks") wastes compute.
+- No dedup: "I live in Delhi" × 3 times = 3 near-identical embeddings stored.
+- No conflict resolution: "I moved to Bangalore" doesn't update old fact.
+
+**3. Slot-based recall** — store facts in named slots, retrieve by slot name.
+- Fast, zero embed. But rigid: new topics get no slot. Scaling means adding slots forever.
+
+**Our approach**: hybrid — slot-direct for known topics + semantic for everything
+else + LLM-based reconcile for conflict resolution. Best of all three.
+
+### Design decisions (why each choice)
+
+| Decision | Alternatives considered | Why this |
+|----------|------------------------|----------|
+| **Postgres+pgvector** not Pinecone/Weaviate | Separate vector DB adds ops burden | Already have Postgres. pgvector is mature, HNSW is fast. One less service to manage. |
+| **Extract facts, not embed raw messages** | Embed every turn (mem0 approach) | Facts are 10-50× smaller. 1 fact ≈ 1 sentence. 100 turns ≈ 30 facts, not 100 embeddings. |
+| **LLM reconcile, not vector dedup** | Cosine similarity threshold alone | "I live in Delhi" and "I live in Bangalore" are 0.7 cosine similar but CONFLICT. Cosine can't distinguish "same topic, updated" from "same fact, duplicate". LLM understands nuance. |
+| **Slot-direct, not only semantic** | Pure vector search for everything | "where do i live?" is predictable. 15 keyword patterns cover 80% of user queries. Zero embed cost for the common case. |
+| **Soft-delete, not hard DELETE** | DELETE rows | Audit trail. Superseded facts are still queryable for past-tense. Archiving preserves history for compliance/debugging. |
+| **Queue, not inline extraction** | `learn()` inline on reply path | If process crashes mid-extraction, facts lost forever. Queue persists first, processes later. Atomic claims prevent double-processing. |
+| **No ORM** | SQLAlchemy | Raw psycopg is 3× faster, zero abstraction. Schema is 3 tables. ORM adds nothing but latency and dependency weight. |
+| **stdlib HTTP server, not Flask** | Flask/FastAPI for UI | HTML UI is a single page. stdlib `ThreadingHTTPServer` is 0 deps, starts in 50ms. FastAPI is for the API path where it adds value (OpenAPI, typing). |
+
+## Comparison: memhero vs mem0 vs agent-memory
+
+| Feature | mem0 | agent-memory | memhero |
+|---------|------|-------------|----------|
+| Embedding per message | Every turn | Every turn (LRU cached) | Slot-direct skips 80%+. LRU cache for rest |
+| Conflict handling | Cosine threshold | Slot-based SUPERSEDE | LLM reconcile: ADD/UPDATE/SUPERSEDE/DELETE per fact |
+| Extraction | Structured json per turn | Slot-classified extraction | Fact extraction with importance + slot + TTL |
+| Memory dedup | Vector threshold | Exact content match | Cosine ≥ 0.65 + LLM reconcile for near-duplicates |
+| Queue/durability | None | Postgres queue with claims | Postgres queue with atomic claims, same pattern |
+| Multi-tenancy | User-level | User-level | org_id + user_id compound isolation |
+| Soft-delete | No | No | status: active/archived/consolidated/superseded |
+| Embedding options | API only | Local only (fastembed) | API + local (sentence-transformers) |
+| TTL/expiry | No | No | expires_at per fact, filtered in search |
+| Interfaces | API + SDK | HTTP server + HTML | CLI, HTTP API, HTML UI, Gradio, FastAPI, MCP |
+
+## How we handle memory — the full lifecycle
+
+### 1. Creation (extraction)
+
+From every user-assistant exchange, the LLM extracts discrete facts. Not raw messages — distilled facts. The prompt instructs: "return a JSON array of facts, each with slot name and importance 0-1." Facts are third-person declarative sentences.
+
+```json
+[{"content": "The user lives in Delhi", "slot": "location", "importance": 0.9},
+ {"content": "The user enjoys cooking pasta", "slot": "hobby", "importance": 0.3}]
+```
+
+Secrets are stripped twice: once by prompt ("never extract secrets"), once by regex guard (cards, keys, tokens).
+
+### 2. Deduplication
+
+Each candidate fact is embedded, then cosine-checked against existing memories (≥ 0.65 similarity). If nothing similar exists, ADD directly — no LLM call needed, saves cost.
+
+If similar memories exist, ONE reconcile LLM call decides per-candidate: ADD (genuinely new), UPDATE (refine in place), SUPERSEDE (replace outdated/conflicting), DELETE (user said it's false), SKIP (exact duplicate).
+
+**Why SUPERSEDE instead of DELETE?** "I live in Delhi" → "I moved to Bangalore" — the Delhi fact is marked `status='superseded'` with `superseded_by` pointing to the Bangalore fact. Past-tense queries ("where did I live before?") can still find it. Future compaction jobs can consolidate old superseded facts.
+
+### 3. Storage
+
+Facts are stored in Postgres with:
+- `embedding` (vector) — for semantic search
+- `slot` — for direct keyword lookup (zero-embed path)
+- `importance` (0-1) — LLM-scored, used in retrieval ranking
+- `expires_at` — optional TTL for transient facts ("visiting Paris next week" → auto-archive after 7 days)
+- `status` — active/archived/consolidated/superseded. Soft-delete for audit trail.
+
+### 4. Retrieval
+
+Three layers, tried in order:
+
+1. **Slot-direct** — if user query contains known slot keywords ("live", "job", "allergy"), fetch directly by slot column. Zero embedding cost, pure DB index scan.
+2. **LRU embed cache** — same query text = same embedding vector cached in-process (4096 entries).
+3. **Semantic search** — embed query → pgvector HNSW index → return top-k=50 → score = `cosine_sim × importance × (1 + log(access_count)) × recency_decay` → select top k=8.
+
+Retrieved facts are injected into the system prompt as `[WHAT YOU REMEMBER ABOUT THIS USER]`. LLM uses them contextually but trusts the user's current statement over stored memories.
+
+### 5. Growth management
+
+Three limits prevent unbounded growth:
+
+1. **Slot dedup** — same slot gets SUPERSEDE'd, not duplicated. User can't accumulate 50 "location: X" facts — only latest is active.
+2. **Scoring decay** — facts older than 90 days get ×0.3 penalty. They drop out of top-k retrieval even if still stored. Effectively invisible for 99% of queries.
+3. **Hard cap (500)** — `enforce_cap` archives lowest-scoring active facts beyond 500 per user. Scoring formula: `age_penalty − access_bonus`, so frequently-accessed old facts survive while stale facts go first.
+
+Future: background compaction job (periodic cosine clustering → LLM consolidation → mark old as `consolidated`). Reduces storage while preserving information density.
+
+### 6. Forgetting
+
+Two paths:
+- **User-initiated**: LLM-based forget via `/api/forget` (natural language query → retrieve candidates → LLM selects which to delete → hard DELETE). UI also supports click-to-delete on individual memory cards.
+- **Automatic**: TTL expiry (`expires_at`), cap eviction (archive), slot supersession (old marked inactive).
+
+### 7. Consistency (read-after-write)
+
+After a turn, facts are INSERTed into `pending_extractions`. The next turn calls `drain_pending()` BEFORE retrieval — any queued facts from the previous turn are processed first. This closes the async consistency gap: user says "I moved to Bangalore", next turn "where do I live?" → sees the new fact.
+
+In demo mode (HTML UI), extraction runs synchronously (`background=False`) — facts stored before reply returns. Zero gap.
+
 ## Stack
 
 | Layer | Choice | Why |

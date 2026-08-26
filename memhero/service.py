@@ -132,7 +132,7 @@ class ChatService:
         except Exception as e:
             print(f"[memhero] background drain failed: {e}")
 
-    _apply_ops(self, user_id: str, candidates: list[str], ops: list[dict], vecs,
+    def _apply_ops(self, user_id: str, candidates: list[str], ops: list[dict], vecs,
                    slots=None, importances=None, ttl_days_list=None) -> int:
         s = store()
         n = 0

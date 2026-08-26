@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 *.log
 INTERVIEW_PREP.md
+paper/
+INTERVIEW_PREP.md
