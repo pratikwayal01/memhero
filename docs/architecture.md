@@ -3,16 +3,16 @@
 ## Design goal
 
 Long-term memory for LLM agents. Extract facts from conversations, store in
-vector DB, retrieve semantically on later turns. Single Python package with
-multiple interfaces (CLI, HTTP, Gradio UI, MCP).
+Postgres+pgvector, retrieve semantically on later turns. Single Python package
+with multiple interfaces (CLI, HTTP API, HTML UI, Gradio UI, MCP).
 
 ## Stack
 
 | Layer | Choice | Why |
 |-------|--------|-----|
-| Chat LLM | OpenAI-compatible (Gemini/OpenRouter) | Swap with env vars |
-| Embeddings | Gemini `gemini-embedding-001` (3072d) or `text-embedding-3-small` (1536d) | Separate base_url/key support |
-| Vector DB | Postgres + pgvector | No new infra — already have Postgres |
+| Chat LLM | OpenAI-compatible (Gemini/OpenRouter) | Swap with env vars; split chat/aux models |
+| Embeddings | API (Gemini/OpenAI) or local (sentence-transformers) | `MEMHERO_EMBED_PROVIDER=local` for zero API cost |
+| Vector DB | Postgres + pgvector | No new infra |
 | Tracing | Langfuse (local docker) | Every LLM call + embedding traced |
 | DB migration | Raw SQL in `schema.sql` | No Alembic overhead for 3 tables |
 
@@ -22,16 +22,16 @@ multiple interfaces (CLI, HTTP, Gradio UI, MCP).
 memhero/
   __init__.py
   config.py        # Config dataclass from env vars
-  core.py          # MemoryStore (Postgres+pgvector), search/near_dupes/add/delete
-  llm.py           # chat(), embed(), extract_facts(), reconcile(), guard_secret()
-  service.py       # ChatService — turn flow, background fact extraction
+  core.py          # MemoryStore (Postgres+pgvector), slot_search, queue, eviction
+  llm.py           # chat, embed (API + local + LRU cache), extract_facts, reconcile, guard_secret
+  service.py       # ChatService — layered retrieval, queue drain, apply_ops
   api.py           # FastAPI server (:8000)
-  http_server.py   # Stdlib HTTP server + HTML UI (:8765)
+  http_server.py   # Stdlib HTTP server + HTML UI (:8765) + startup DB check
   ui.py            # Gradio UI (:7860)
   cli.py           # Interactive REPL
   mcp_server.py    # MCP stdio server (remember/recall/forget/memories tools)
   templates/
-    index.html     # Dark-themed HTML UI
+    index.html     # Dark-themed HTML UI with memory toggle, click-to-delete
 schema.sql         # Table definitions
 eval/
   run_eval.py      # 9-scenario Langfuse eval runner
@@ -44,53 +44,94 @@ docs/
 ```
 user_msg
   │
-  ▼
-embed(msg) ──► pgvector HNSW search (k=8, min_sim=0.25)
+  ├─► Drain pending extractions (close async consistency gap)
   │
-  ▼
-[WHAT YOU REMEMBER ABOUT THIS USER] block injected into system prompt
+  ├─► Slot detection: keyword match → ["location", "job", ...]
+  │     │
+  │     ├─ slot found → slot_search() DB query (0ms, zero embedding)
+  │     └─ no match + word_count ≥ gate → embed(msg) via LRU cache
+  │           → pgvector HNSW search (k=8, min_sim=0.25)
+  │           → score: sim × importance × (1+log(access)) × recency_decay
   │
-  ▼
-chat(messages) ──► reply returned to user
+  ├─► Merge: slot-direct results + semantic results, dedup by id
   │
-  ▼ (background thread)
-extract_facts(user_msg, reply) ──► guard_secret() ──► near_duplicates()
+  ├─► [WHAT YOU REMEMBER ABOUT THIS USER] block injected into system prompt
   │
-  ├─ no matches → ADD all candidates (no LLM call needed)
-  └─ matches → reconcile() LLM call → ADD / UPDATE / SUPERSEDE / DELETE / SKIP
+  ├─► chat(messages) ──► reply returned to user
+  │
+  └─► Enqueue turn → pending_extractions (crash-safe queue)
+        Background thread: drain → extract_facts → reconcile → write
 ```
+
+### Layered retrieval (why it's fast)
+
+| Layer | Latency | Triggers | Example |
+|-------|---------|----------|---------|
+| Slot-direct | 0ms | Keyword match in query | "where do i live?" |
+| LRU embed cache | 0ms | Same text seen before | Repeated "how are you?" |
+| Word-count gate | 0ms | `< N` word messages | "ok", "thanks" |
+| Local semantic | ~5ms | New substantive msg | "I started learning piano" |
+| API semantic | 50-450ms | New msg with API provider | Same as above, remote embed |
 
 ## Reconcile flow (write path)
 
 After extracting candidate facts from an exchange:
 
-1. **Secret guard**: regex drops secrets (cards, keys, auth tokens)
+1. **Secret guard**: regex drops cards (13-19 digits), API keys (`sk-...`), AWS keys (`AKIA...`), long hex/base64 — code-enforced double layer after prompt guard
 2. **Near-duplicate search**: cosine sim ≥ 0.65 against existing memories
 3. **Skip or reconcile**:
-   - No similar memories → ADD all candidates directly (no LLM call — saves cost)
+   - No similar memories → ADD all directly (no LLM call — saves 50%+ cost)
    - Similar memories found → ONE reconcile LLM call decides per-candidate: ADD / UPDATE / SUPERSEDE / DELETE / SKIP
-4. **Apply ops**: write to `memories` table, audit to `memory_events`
+4. **Apply ops**: write to `memories` table with importance + slot + optional TTL, audit to `memory_events`
+5. **Eviction**: `enforce_cap(500)` archives lowest-scored active memories (age × access_count)
 
-Supersede example: "I live in Delhi" then later "moved to Bangalore" → old
-row marked SUPERSEDE, new row ADDed. Query-time only returns active rows.
+### Importance extraction
+
+LLM scores each fact 0-1 during extraction. Used in retrieval scoring:
+
+```
+score = cosine_sim × importance × (1 + log(access_count)) × recency_decay
+```
+
+High-importance facts (identity: name, location) survive longer than low-importance (hobby, preference).
 
 ## Database schema
 
 ```sql
--- extensions
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS citext;  -- case-insensitive user_id
+memories (
+  id UUID PK, org_id TEXT, user_id TEXT, slot TEXT,
+  content TEXT, embedding vector, importance REAL DEFAULT 0.5,
+  expires_at TIMESTAMPTZ,
+  status TEXT DEFAULT 'active' -- active/archived/consolidated/superseded
+  superseded_by TEXT, access_count INT, ...
+)
 
--- tables
-memories (id uuid PK, user_id citext, content text, embedding vector(3072),
-          deleted_reason text DEFAULT NULL, superseded_by text DEFAULT NULL,
-          access_count int, last_accessed timestamptz, created_at, updated_at)
+memory_events (id, org_id, user_id, memory_id, action, detail JSONB, ...)
 
-memory_events (id uuid PK, user_id citext, memory_id uuid FK, op text,
-               payload jsonb, created_at timestamptz)
+pending_extractions (id, org_id, user_id, turn JSONB, claimed_by, claimed_at, ...)
 
--- index: HNSW on embedding for similarity search
+-- Indexes
+HNSW on embedding WHERE status='active' (≤2000 dim models only)
+B-tree on (org_id, user_id)
+B-tree on (org_id, user_id, slot) WHERE status='active'
+B-tree on expires_at WHERE expires_at IS NOT NULL
 ```
+
+**Why soft-delete?** `status = 'archived'` instead of DELETE. Audit trail preserved. Eviction + reset use soft-delete.
+
+## Extraction queue (crash-safe)
+
+Every turn is `INSERT`ed into `pending_extractions` immediately after reply.
+Background worker calls `drain()` which uses `UPDATE ... WHERE (claimed_by IS NULL OR claimed_at < 5 min) RETURNING *` — atomic row-level claims. Two workers never double-process. If worker crashes, stale claims re-claimed after 5 min.
+
+## Embedding providers
+
+| Provider | Config | Dims | Install |
+|----------|--------|------|---------|
+| `api` (default) | `MEMHERO_EMBED_MODEL`, `MEMHERO_EMBED_API_KEY`, `MEMHERO_EMBED_BASE_URL` | varies | none |
+| `local` | `MEMHERO_LOCAL_MODEL` (default `all-MiniLM-L6-v2`) | 384 | `uv sync --extra local-embeddings` |
+
+Vector dimensions auto-detected. Override with `MEMHERO_VECTOR_DIMS`. LRU cache (4096 entries) avoids recompute.
 
 ## Interfaces
 
@@ -117,13 +158,16 @@ memory_events (id uuid PK, user_id citext, memory_id uuid FK, op text,
 
 Memory-OFF is baseline: fresh session each turn, no cross-turn knowledge.
 
-## Budget per turn
+## Per-turn cost
 
-| Step | Cost |
-|------|------|
-| Embed user message | 1 embedding call (~50ms) |
-| HNSW search | ~1ms |
-| Chat reply | 1 LLM call |
-| Background extract | 1 embed + ≤2 small LLM calls (off critical path) |
+| Step | Mode | Latency |
+|------|------|---------|
+| Slot-direct | Always | 0ms (DB index scan) |
+| Semantic embed | API provider | 50-450ms |
+| Semantic embed | Local provider | ~5ms |
+| HNSW search | Always | ~1ms |
+| Chat reply | Always | 1000-3000ms (dominant) |
+| Write path | Async queue | Off critical path |
 
-Memory adds ~50ms to the reply path (embed + search). Everything else is async.
+Net memory overhead: 0ms (slot-direct) to ~5ms (local embed) to ~450ms (API embed).
+LLM reply is the bottleneck, not memory.
