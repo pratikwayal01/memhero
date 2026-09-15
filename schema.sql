@@ -17,7 +17,6 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS memories_embedding_hnsw ON memories USING hnsw (embedding vector_cosine_ops) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS memories_org_user_idx ON memories (org_id, user_id);
 CREATE INDEX IF NOT EXISTS memories_slot_idx ON memories (org_id, user_id, slot) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS memories_expires_idx ON memories (expires_at) WHERE expires_at IS NOT NULL;
