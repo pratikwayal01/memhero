@@ -84,3 +84,20 @@ scenarios:
     generated: colleagues_30
     probe: "What drink does my colleague Meera prefer?"
     expect_contains: ["cold brew"]
+
+  - name: recall-medication
+    category: medical-history
+    seeds:
+      - - "I'm diabetic and take metformin 500mg twice daily."
+    probe: "Which medication am I on?"
+    expect_contains: ["metformin"]
+
+  - name: recall-blood-type
+    category: medical-history
+    seeds:
+      - - "My blood group is A positive. Also had my appendix removed in 2021."
+    probe: "What's my blood type?"
+    expect_contains: ["A positive"]
+    judge_rubric: >
+      Pass if the answer states the blood type A positive. Fail if it answers with
+      the appendix surgery or any other unrelated medical fact instead.

@@ -56,7 +56,7 @@ def _retry(fn, *args, **kwargs):
             wait = min(30 * (attempt + 1), 60)
             print(f"[memhero] rate limited, waiting {wait}s", flush=True)
             time.sleep(wait)
-        except (openai.APITimeoutError, openai.APIConnectionError) as e:
+        except (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError) as e:
             wait = 5
             print(f"[memhero] {type(e).__name__}, retrying in {wait}s", flush=True)
             time.sleep(wait)
@@ -142,7 +142,7 @@ Rules:
 - Preserve temporal qualifiers VERBATIM ("moved to Bangalore in July 2026", "lived in Delhi until March").
 - Do not extract: transient state ("I'm tired"), assistant statements, opinions about the assistant.
 - Never extract secrets: passwords, API keys, tokens, card numbers, government IDs. Skip them entirely.
-- Assign a short lowercase slot name if the fact belongs to a known category (location, job, diet, relationship, pet, allergy, name, age, hobby). Use null for uncategorized facts.
+- Assign a short lowercase slot name if the fact belongs to a known category (location, job, diet, relationship, pet, allergy, name, age, hobby, medical_condition, medication, blood_type, surgery). Use null for uncategorized facts.
 - Return a JSON array of objects: [{"content": "...", "slot": "location"|null}, ...].
 - Empty array [] if nothing worth remembering."""
 
@@ -242,10 +242,17 @@ SLOT_ALIASES = {
     "name": ["name", "called", "my name is", "i'm called"],
     "age": ["age", "old", "years old", "born", "birthday"],
     "hobby": ["hobby", "hobbies", "like to", "enjoy", "interest", "play", "sport", "game"],
+    "medical_condition": ["condition", "diagnos", "diabetes", "asthma", "blood pressure", "hypertension",
+                          "thyroid", "disease", "suffer", "chronic", "sick"],
+    "medication": ["medication", "medicine", "meds", "tablet", "prescription", "dose", "pill", "drug"],
+    "blood_type": ["blood type", "blood group"],
+    "surgery": ["surgery", "operation", "operated", "procedure"],
 }
 
 
 def detect_slots(query: str) -> list[str]:
     """Return slot names triggered by query keywords. Cheap, no embedding."""
     q = query.lower()
-    return [slot for slot, aliases in SLOT_ALIASES.items() if any(a in q for a in aliases)]
+    # word-boundary match: "cat" must not fire inside "medication"
+    return [slot for slot, aliases in SLOT_ALIASES.items()
+            if any(re.search(rf"\b{re.escape(a)}\b", q) for a in aliases)]
